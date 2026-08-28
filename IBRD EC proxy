@@ -1,0 +1,517 @@
+"""
+IBRD Sovereign Portfolio — Illustrative KMV/Vasicek Economic Capital Model
+===========================================================================
+
+Built entirely from public IBRD/IDA disclosures plus explicit, clearly-labeled
+assumptions wherever confidential internal data (individual country PDs, LGDs,
+correlations, or IBRD's own EC model) would otherwise be required.
+
+WHAT'S REAL PUBLIC DATA vs. WHAT'S AN ASSUMPTION
+-------------------------------------------------
+Real, sourced (IBRD MD&A and Condensed Quarterly Financial Statements, March 31, 2026,
+unless noted otherwise):
+  - IBRD total loan exposures (gross, used as model total EAD): $286.81bn
+        This is the exact "Loan exposures" figure IBRD itself uses in its
+        Equity-to-Loans ratio calculation (Table 12).
+  - IBRD total equity:            $72.34bn; Equity-to-Loans ratio 21.4% (policy min. 18%)
+  - Top-10 country exposures (exact): India $21.9bn, Indonesia $20.8bn, Philippines
+    $16.7bn, Colombia $16.4bn, Brazil $16.0bn, Turkiye $15.1bn, China $13.7bn,
+    Mexico $13.3bn, Argentina $13.1bn, Morocco $11.9bn -- together 57% of total
+    exposure (Figure 10: Country Exposures as of March 31, 2026)
+  - Ukraine (exact): loans outstanding $16.8bn; guarantees provided $0.4bn;
+    guarantees/credit enhancements RECEIVED from third parties $11.5bn; NET
+    exposure to Ukraine $5.7bn
+  - Zimbabwe (exact): nonaccrual since Oct 2000; loans outstanding $424mm;
+    accumulated provision $212mm (Table D2)
+  - Belarus (exact): nonaccrual since Oct 2022; loans outstanding $1,005mm;
+    accumulated provision $104mm (Table D2)
+  - Non-accrual borrowers overall: 0.5% of total loans outstanding
+  - Single Borrower Limit context: FY26 SBL is $31.7bn (below Graduation
+    Discussion Income threshold) / $22.6bn (above it)
+
+Illustrative / assumed (see docstrings below for exactly which):
+  - "All other IBRD borrowers" residual bucket (~110 countries, blended --
+    the exact confidential country-by-country breakdown of this remainder
+    is not public)
+  - Individual country credit ratings (approximate public agency ratings, used
+    only to map to a public PD table -- NOT IBRD's confidential internal 1-100
+    country risk scores)
+  - Rating -> PD table (stylized public sovereign default curve)
+  - Preferred-creditor PD haircut h (the single most important, most uncertain
+    assumption in the whole model -- see the sensitivity analysis)
+  - LGD (5%-20% range, near-zero historical write-offs -- though see the
+    reality-check function below, which shows Zimbabwe's actual realized loss
+    rate is running well above this range)
+  - Sovereign asset correlation rho (10%-35% range)
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import os
+
+OUT_DIR = "/mnt/user-data/outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+pd.options.display.float_format = "{:,.2f}".format
+
+# =============================================================================
+# 1. PORTFOLIO
+# =============================================================================
+
+# Country-level allocation. As of this update, the top-10 countries, Ukraine,
+# Zimbabwe, and Belarus are REAL disclosed figures from IBRD's March 31, 2026
+# Financial Statements (MD&A, Figure 10 and Table D2). Only the "All other
+# borrowers" residual bucket and the credit ratings (used solely to map to a
+# public PD table) remain illustrative.
+PORTFOLIO = pd.DataFrame([
+    # id, country,                                          region,                     rating, ead_mm
+    (1,  "India",                                           "South Asia",               "BBB", 21900),
+    (2,  "Indonesia",                                        "East Asia & Pacific",      "BBB", 20800),
+    (3,  "Philippines",                                      "East Asia & Pacific",      "BBB", 16700),
+    (4,  "Colombia",                                         "Latin America & Carib.",   "BB",  16400),
+    (5,  "Brazil",                                           "Latin America & Carib.",   "BB",  16000),
+    (6,  "Turkiye",                                           "Europe & Central Asia",   "BB",  15100),
+    (7,  "China",                                             "East Asia & Pacific",     "A",   13700),
+    (8,  "Mexico",                                            "Latin America & Carib.",  "BBB", 13300),
+    (9,  "Argentina",                                         "Latin America & Carib.",  "CCC", 13100),
+    (10, "Morocco",                                           "MENA",                    "BB",  11900),
+    (11, "Ukraine",                                           "Europe & Central Asia",   "B",   16800),  # real, Mar 2026 (gross)
+    (12, "Zimbabwe",                                          "Sub-Saharan Africa",      "D",     424),  # real, nonaccrual since Oct 2000
+    (13, "Belarus",                                           "Europe & Central Asia",   "D",    1005),  # real, nonaccrual since Oct 2022
+    (14, "All other IBRD borrowers (~110 countries, blended)","Diversified",             "BB", 109677),
+], columns=["id", "country", "region", "rating", "ead_mm"])
+
+assert PORTFOLIO["ead_mm"].sum() == 286_806, "Portfolio EAD must equal IBRD's real gross loan exposures (Mar 2026)"
+
+# Real disclosed detail on Ukraine's credit-enhancement structure (Mar 2026):
+# gross loans outstanding $16.8bn, guarantees provided $0.4bn, guarantees and
+# other credit enhancements RECEIVED from third parties $11.5bn, bringing
+# IBRD's NET exposure to Ukraine down to $5.7bn. The base case below uses the
+# gross figure (consistent treatment with every other country, and it ties
+# exactly to IBRD's official $286.8bn total loan exposure figure); see
+# `ukraine_guarantee_adjustment()` for the net-of-guarantee alternative.
+UKRAINE_GROSS_EAD_MM = 16_800
+UKRAINE_NET_EAD_MM = 5_700
+
+# Real disclosed detail on IBRD's two nonaccrual borrowers (Mar 2026):
+# accumulated provision / loans outstanding gives an ACTUAL realized loss rate,
+# useful as a cross-check on the 5%-20% LGD range assumed elsewhere.
+REALIZED_LOSS_CHECK = pd.DataFrame([
+    ("Zimbabwe", "Oct 2000", 424, 212),
+    ("Belarus",  "Oct 2022", 1005, 104),
+], columns=["country", "nonaccrual_since", "loans_outstanding_mm", "actual_provision_mm"])
+REALIZED_LOSS_CHECK["implied_realized_lgd"] = (
+    REALIZED_LOSS_CHECK["actual_provision_mm"] / REALIZED_LOSS_CHECK["loans_outstanding_mm"])
+
+# Illustrative public sovereign 1-year PD curve, by rating (stylized).
+RATING_PD = {
+    "AAA": 0.0000, "AA": 0.0002, "A": 0.0008, "BBB": 0.0025,
+    "BB": 0.0120, "B": 0.0450, "CCC": 0.1500, "D": 0.9999,
+}
+
+# Real benchmark figures (for comparison only, not inputs to the EC formula)
+IBRD_ACTUAL_EQUITY_MM = 72_342           # Mar 31, 2026
+IBRD_ACTUAL_LOANS_MM = 286_806           # Mar 31, 2026 (gross loan exposures, per Table 12)
+IBRD_ACTUAL_EQUITY_TO_LOANS = 0.214      # Mar 31, 2026
+
+# =============================================================================
+# 2. BASE-CASE ASSUMPTIONS
+# =============================================================================
+
+BASE = dict(
+    alpha=0.999,   # confidence level for Economic Capital
+    rho=0.20,      # sovereign asset correlation (single systematic factor)
+    lgd=0.125,     # preferred-creditor LGD (5%-20% range per public disclosures)
+    h=0.35,        # preferred-creditor PD haircut (public PD x h = IBRD's effective PD)
+)
+
+
+# =============================================================================
+# 3. THE MODEL
+# =============================================================================
+def public_pd(rating_series: pd.Series) -> pd.Series:
+    """Map a Series of rating labels to the illustrative public sovereign PD curve."""
+    return rating_series.map(RATING_PD)
+
+
+def stressed_pd(pd_cond: np.ndarray, rho: float, alpha: float) -> np.ndarray:
+    """
+    Single-factor Vasicek / Merton conditional (stressed) default probability.
+
+        PD(alpha) = N[ (N^-1(PD) + sqrt(rho)*N^-1(alpha)) / sqrt(1-rho) ]
+
+    This is exactly the formula underlying corporate KMV portfolio capital and
+    the Basel IRB risk-weight function -- here applied to sovereign PDs.
+    """
+    pd_cond = np.clip(pd_cond, 1e-9, 0.9999)  # guard N^-1(0) / N^-1(1) singularities
+    z = (norm.ppf(pd_cond) + np.sqrt(rho) * norm.ppf(alpha)) / np.sqrt(1 - rho)
+    return norm.cdf(z)
+
+
+def run_model(df: pd.DataFrame, lgd: float, rho: float, alpha: float, h: float) -> pd.DataFrame:
+    """
+    Full per-country Economic Capital calculation.
+
+        Conditional PD_i        = h * PD_public(rating_i)      [preferred-creditor haircut]
+        Stressed PD_i(alpha)    = Vasicek formula above
+        Capital rate K_i        = LGD * [PD_i(alpha) - PD_i]
+        Economic Capital EC_i   = EAD_i * K_i
+    """
+    out = df.copy()
+    out["public_pd"] = public_pd(out["rating"])
+    out["cond_pd"] = np.clip(out["public_pd"] * h, 0, 0.9999)
+    out["stressed_pd"] = stressed_pd(out["cond_pd"].to_numpy(), rho, alpha)
+    out["lgd"] = lgd
+    out["el_mm"] = out["ead_mm"] * out["cond_pd"] * out["lgd"]
+    out["capital_rate"] = out["lgd"] * (out["stressed_pd"] - out["cond_pd"])
+    out["ec_mm"] = out["ead_mm"] * out["capital_rate"]
+    return out
+
+
+def portfolio_ec(df: pd.DataFrame, lgd: float, rho: float, alpha: float, h: float) -> float:
+    """Portfolio Economic Capital ($mm) -- the single-factor ASRF sum used by the grids below."""
+    result = run_model(df, lgd, rho, alpha, h)
+    return result["ec_mm"].sum()
+
+
+# =============================================================================
+# 4. BASE CASE
+# =============================================================================
+def print_base_case():
+    result = run_model(PORTFOLIO, **BASE)
+    total_ead = result["ead_mm"].sum()
+    total_el = result["el_mm"].sum()
+    total_ec = result["ec_mm"].sum()
+
+    print("=" * 78)
+    print("BASE CASE — per-country detail")
+    print("=" * 78)
+    show = result[["country", "region", "rating", "ead_mm", "public_pd", "cond_pd",
+                    "stressed_pd", "capital_rate", "ec_mm"]].copy()
+    show.columns = ["Country", "Region", "Rating", "EAD($mm)", "PublicPD", "CondPD",
+                     "StressedPD", "CapRate", "EC($mm)"]
+    with pd.option_context("display.width", 160, "display.max_columns", None):
+        print(show.to_string(index=False,
+              formatters={"EAD($mm)": "{:,.0f}".format, "PublicPD": "{:.2%}".format,
+                          "CondPD": "{:.3%}".format, "StressedPD": "{:.3%}".format,
+                          "CapRate": "{:.4%}".format, "EC($mm)": "{:,.1f}".format}))
+
+    print("\n" + "-" * 78)
+    print(f"Total EAD:                        ${total_ead:,.0f}mm")
+    print(f"Total Expected Loss:               ${total_el:,.1f}mm")
+    print(f"Portfolio Economic Capital (99.9%): ${total_ec:,.1f}mm  ({total_ec/total_ead:.2%} of EAD)")
+    print(f"IBRD's actual equity (real):        ${IBRD_ACTUAL_EQUITY_MM:,.0f}mm")
+    print(f"Modeled EC as % of actual equity:   {total_ec/IBRD_ACTUAL_EQUITY_MM:.1%}")
+    print(f"Actual equity-to-loans ratio:       {IBRD_ACTUAL_EQUITY_TO_LOANS:.1%}")
+    print(f"Implied min. equity-to-loans (model):{total_ec/total_ead:.2%}")
+    print("-" * 78)
+    print("Reading this: modeled EC is what a bank-style Vasicek/KMV capital model would")
+    print("charge for unexpected loss on this book. IBRD holds far more capital than this")
+    print("because its policy equity-to-loans ratio is built around callable capital and a")
+    print("much more conservative country-risk framework -- not a Basel-style bank EC model.")
+    print("=" * 78 + "\n")
+    result.to_csv(os.path.join(OUT_DIR, "ibrd_ec_base_case.csv"), index=False)
+    return result
+
+
+def print_reality_check():
+    """Compare actual disclosed nonaccrual-borrower loss experience to what the
+    model's uniform 12.5% base-case LGD would imply for those same borrowers."""
+    result = run_model(PORTFOLIO, **BASE)
+    print("=" * 78)
+    print("REALITY CHECK — actual realized loss experience vs. model's uniform LGD")
+    print("=" * 78)
+    rc = REALIZED_LOSS_CHECK.copy()
+    model_el = result.set_index("country").loc[rc["country"], "el_mm"].to_numpy()
+    rc["model_el_at_12.5pct_lgd_mm"] = model_el
+    print(rc.to_string(index=False, formatters={
+        "implied_realized_lgd": "{:.1%}".format,
+        "model_el_at_12.5pct_lgd_mm": "{:,.1f}".format}))
+    print("-" * 78)
+    print("Zimbabwe's realized loss rate (~50%, a fully-aged 25-year-old default) is roughly")
+    print("4x the model's base-case 12.5% LGD assumption. Belarus (defaulted 2022) is still")
+    print("provisioning up and is less informative about its eventual steady-state loss rate.")
+    print("This is a real signal that 12.5% may be optimistic for the tail of this portfolio.")
+    print("=" * 78 + "\n")
+    rc.to_csv(os.path.join(OUT_DIR, "reality_check_nonaccrual_lgd.csv"), index=False)
+    return rc
+
+
+def print_ukraine_guarantee_adjustment():
+    """
+    IBRD discloses that of Ukraine's $16.8bn gross loans outstanding, $11.5bn is
+    covered by guarantees/credit enhancements from third parties, leaving a real
+    NET exposure of only $5.7bn. This compares portfolio EC using the gross
+    (base-case, consistent-treatment) figure against a version using the
+    guarantee-adjusted net figure.
+    """
+    df_gross = PORTFOLIO.copy()
+    df_net = PORTFOLIO.copy()
+    df_net.loc[df_net["country"] == "Ukraine", "ead_mm"] = UKRAINE_NET_EAD_MM
+
+    ec_gross = portfolio_ec(df_gross, **BASE)
+    ec_net = portfolio_ec(df_net, **BASE)
+
+    print("=" * 78)
+    print("UKRAINE CREDIT-ENHANCEMENT ADJUSTMENT")
+    print("=" * 78)
+    print(f"Ukraine gross loans outstanding:            ${UKRAINE_GROSS_EAD_MM:,}mm")
+    print(f"  (IBRD also disclosed guarantees provided of $0.4bn and guarantees/credit")
+    print(f"   enhancements RECEIVED of $11.5bn; net effect shown below)")
+    print(f"Ukraine NET exposure (per IBRD disclosure):  ${UKRAINE_NET_EAD_MM:,}mm")
+    print("-" * 78)
+    print(f"Portfolio EC using Ukraine GROSS exposure:   ${ec_gross:,.1f}mm")
+    print(f"Portfolio EC using Ukraine NET exposure:     ${ec_net:,.1f}mm")
+    print(f"Difference:                                  ${ec_gross - ec_net:,.1f}mm")
+    print("-" * 78)
+    print("The base case in this model uses the gross figure for consistent treatment across")
+    print("all countries (and because it ties exactly to IBRD's official $286.8bn total). But")
+    print("this shows explicitly how much of Ukraine's modeled capital charge is really being")
+    print("carried by IBRD's third-party guarantors rather than IBRD itself.")
+    print("=" * 78 + "\n")
+    return dict(ec_gross=ec_gross, ec_net=ec_net)
+
+
+# =============================================================================
+# 5. SENSITIVITY ANALYSIS
+# =============================================================================
+def sensitivity_grid_lgd_rho():
+    lgd_vals = [0.05, 0.10, 0.125, 0.15, 0.20]
+    rho_vals = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35]
+    grid = pd.DataFrame(index=pd.Index(lgd_vals, name="LGD"),
+                         columns=pd.Index(rho_vals, name="rho"), dtype=float)
+    for l in lgd_vals:
+        for r in rho_vals:
+            grid.loc[l, r] = portfolio_ec(PORTFOLIO, lgd=l, rho=r,
+                                           alpha=BASE["alpha"], h=BASE["h"])
+    return grid
+
+
+def sensitivity_grid_alpha_h():
+    alpha_vals = [0.99, 0.995, 0.999, 0.9995, 0.9999]
+    h_vals = [0.10, 0.20, 0.35, 0.50, 0.75, 0.99]
+    grid = pd.DataFrame(index=pd.Index(alpha_vals, name="alpha"),
+                         columns=pd.Index(h_vals, name="h"), dtype=float)
+    for a in alpha_vals:
+        for h in h_vals:
+            grid.loc[a, h] = portfolio_ec(PORTFOLIO, lgd=BASE["lgd"], rho=BASE["rho"],
+                                           alpha=a, h=h)
+    return grid
+
+
+def tornado_sensitivity():
+    base_ec = portfolio_ec(PORTFOLIO, **BASE)
+    specs = [
+        ("LGD",                     0.05,  0.20,
+         lambda v: portfolio_ec(PORTFOLIO, lgd=v, rho=BASE["rho"], alpha=BASE["alpha"], h=BASE["h"])),
+        ("Correlation (rho)",       0.10,  0.35,
+         lambda v: portfolio_ec(PORTFOLIO, lgd=BASE["lgd"], rho=v, alpha=BASE["alpha"], h=BASE["h"])),
+        ("Confidence (alpha)",      0.99,  0.9999,
+         lambda v: portfolio_ec(PORTFOLIO, lgd=BASE["lgd"], rho=BASE["rho"], alpha=v, h=BASE["h"])),
+        ("Preferred-creditor h",    0.10,  0.99,
+         lambda v: portfolio_ec(PORTFOLIO, lgd=BASE["lgd"], rho=BASE["rho"], alpha=BASE["alpha"], h=v)),
+    ]
+    rows = []
+    for name, lo, hi, fn in specs:
+        ec_lo, ec_hi = fn(lo), fn(hi)
+        rows.append(dict(parameter=name, low_value=lo, high_value=hi,
+                          ec_at_low=ec_lo, ec_at_high=ec_hi, range_mm=abs(ec_hi - ec_lo)))
+    df = pd.DataFrame(rows).sort_values("range_mm", ascending=False)
+    return base_ec, df
+
+
+def print_sensitivity():
+    print("=" * 78)
+    print("SENSITIVITY — Grid 1: EC ($mm) by LGD x correlation rho  (alpha=99.9%, h=35%)")
+    print("=" * 78)
+    g1 = sensitivity_grid_lgd_rho()
+    print(g1.round(0).to_string())
+    g1.to_csv(os.path.join(OUT_DIR, "sensitivity_grid_lgd_rho.csv"))
+
+    print("\n" + "=" * 78)
+    print("SENSITIVITY — Grid 2: EC ($mm) by confidence alpha x haircut h  (LGD=12.5%, rho=20%)")
+    print("=" * 78)
+    g2 = sensitivity_grid_alpha_h()
+    print(g2.round(0).to_string())
+    g2.to_csv(os.path.join(OUT_DIR, "sensitivity_grid_alpha_h.csv"))
+
+    print("\n" + "=" * 78)
+    print("SENSITIVITY — Tornado (one-at-a-time around the base case)")
+    print("=" * 78)
+    base_ec, tdf = tornado_sensitivity()
+    print(f"Base-case EC: ${base_ec:,.0f}mm\n")
+    print(tdf.to_string(index=False, formatters={
+        "low_value": "{:.2%}".format, "high_value": "{:.2%}".format,
+        "ec_at_low": "{:,.0f}".format, "ec_at_high": "{:,.0f}".format,
+        "range_mm": "{:,.0f}".format}))
+    tdf.to_csv(os.path.join(OUT_DIR, "sensitivity_tornado.csv"), index=False)
+    print("=" * 78 + "\n")
+    return g1, g2, base_ec, tdf
+
+
+# =============================================================================
+# 6. MONTE CARLO CROSS-CHECK
+# =============================================================================
+def expand_for_granularity(df: pd.DataFrame, n_split: int = 100) -> pd.DataFrame:
+    """
+    The 'All other IBRD borrowers' row represents ~120 real countries lumped into
+    one line for readability. Simulating it as one giant obligor would create
+    artificial single-name concentration risk that doesn't exist in reality.
+    For Monte Carlo purposes only, split it into n_split equal-sized pseudo-
+    obligors (same rating/PD, same correlation to the systematic factor, but
+    independent idiosyncratic risk) -- a standard granularity-adjustment trick.
+    """
+    mask = df["region"] == "Diversified"
+    lumped = df[mask]
+    rest = df[~mask]
+    pieces = []
+    for _, row in lumped.iterrows():
+        sub = pd.DataFrame([row] * n_split)
+        sub["ead_mm"] = row["ead_mm"] / n_split
+        sub["country"] = [f"{row['country']} #{i+1}" for i in range(n_split)]
+        pieces.append(sub)
+    return pd.concat([rest] + pieces, ignore_index=True)
+
+
+def monte_carlo(df: pd.DataFrame, lgd: float, rho: float, h: float,
+                 n_sims: int = 200_000, alpha: float = 0.999, seed: int = 42,
+                 granularity_split: int = 100) -> dict:
+    """
+    Single-factor Gaussian-copula default simulation -- the "real" way portfolio
+    credit models (incl. Moody's/KMV and CreditMetrics) build the loss
+    distribution, as a cross-check on the closed-form Vasicek/ASRF number above.
+
+    For each simulation draw:
+        asset_i = sqrt(rho)*Z_systematic + sqrt(1-rho)*Z_idiosyncratic_i
+        default_i occurs if asset_i < N^-1(cond_pd_i)
+        loss = sum_i EAD_i * LGD * default_i
+
+    The diversified "all other borrowers" bucket is first split into many equal
+    pseudo-obligors (see expand_for_granularity) so it isn't simulated as one
+    artificially lumpy $91.7bn obligor.
+    """
+    sim_df = expand_for_granularity(df, n_split=granularity_split)
+    rng = np.random.default_rng(seed)
+    cond_pd = np.clip((sim_df["rating"].map(RATING_PD) * h).to_numpy(), 1e-9, 0.9999)
+    default_threshold = norm.ppf(cond_pd)          # per-country asset threshold
+    ead = sim_df["ead_mm"].to_numpy()
+
+    Z = rng.standard_normal(n_sims)                              # systematic factor
+    eps = rng.standard_normal((n_sims, len(sim_df)))              # idiosyncratic
+    assets = np.sqrt(rho) * Z[:, None] + np.sqrt(1 - rho) * eps
+    defaults = assets < default_threshold[None, :]
+    losses = defaults @ (ead * lgd)                               # $mm per simulation
+
+    el = losses.mean()
+    var_alpha = np.quantile(losses, alpha)
+    ec_simulated = var_alpha - el
+    ec_analytical = portfolio_ec(df, lgd, rho, alpha, h)
+
+    return dict(losses=losses, el=el, var_alpha=var_alpha,
+                ec_simulated=ec_simulated, ec_analytical=ec_analytical,
+                n_obligors_simulated=len(sim_df))
+
+
+def print_monte_carlo(mc: dict):
+    print("=" * 78)
+    print("MONTE CARLO CROSS-CHECK — single-factor Gaussian-copula simulation")
+    print("=" * 78)
+    print(f"Simulations:                     {len(mc['losses']):,}")
+    print(f"Obligors simulated (post-split):  {mc['n_obligors_simulated']:,}")
+    print(f"Simulated Expected Loss:         ${mc['el']:,.1f}mm")
+    print(f"Simulated 99.9% VaR:              ${mc['var_alpha']:,.1f}mm")
+    print(f"Simulated Economic Capital:       ${mc['ec_simulated']:,.1f}mm")
+    print(f"Analytical (Vasicek/ASRF) EC:     ${mc['ec_analytical']:,.1f}mm")
+    diff = mc["ec_simulated"] - mc["ec_analytical"]
+    print(f"Difference (sim - analytical):    ${diff:,.1f}mm ({diff/mc['ec_analytical']:.1%})")
+    print("-" * 78)
+    print("The analytical ASRF formula assumes an infinitely fine-grained portfolio, so it")
+    print("understates risk for a concentrated book like this one -- 10 real named countries")
+    print("plus Ukraine/Zimbabwe/Belarus, several individually >4% of EAD. The Monte Carlo")
+    print("simulation captures that name-concentration effect directly, which is why it")
+    print("typically shows meaningfully higher Economic Capital.")
+    print("=" * 78 + "\n")
+
+
+# =============================================================================
+# 7. CHARTS
+# =============================================================================
+def make_charts(g1, g2, base_ec, tdf, mc):
+    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
+
+    # --- Chart 1: EC vs rho, one line per LGD ---
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for lgd_val in g1.index:
+        ax.plot(g1.columns, g1.loc[lgd_val], marker="o", label=f"LGD={lgd_val:.1%}")
+    ax.set_xlabel("Sovereign asset correlation, ρ")
+    ax.set_ylabel("Portfolio Economic Capital ($mm)")
+    ax.set_title("EC vs. correlation ρ, by LGD  (α=99.9%, h=35%)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "chart_ec_vs_rho.png"), dpi=150)
+    plt.close(fig)
+
+    # --- Chart 2: EC vs haircut h, one line per confidence level ---
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for a_val in g2.index:
+        ax.plot(g2.columns, g2.loc[a_val], marker="o", label=f"α={a_val:.2%}")
+    ax.set_xlabel("Preferred-creditor PD haircut, h")
+    ax.set_ylabel("Portfolio Economic Capital ($mm)")
+    ax.set_title("EC vs. haircut h, by confidence level  (LGD=12.5%, ρ=20%)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "chart_ec_vs_haircut.png"), dpi=150)
+    plt.close(fig)
+
+    # --- Chart 3: tornado ---
+    fig, ax = plt.subplots(figsize=(8, 5))
+    y = np.arange(len(tdf))
+    tdf_sorted = tdf.sort_values("range_mm")
+    ax.barh(y, tdf_sorted["ec_at_high"] - tdf_sorted["ec_at_low"],
+            left=tdf_sorted[["ec_at_low", "ec_at_high"]].min(axis=1), color="#1F4E78")
+    ax.axvline(base_ec, color="darkred", linestyle="--", label=f"Base case (${base_ec:,.0f}mm)")
+    ax.set_yticks(y)
+    ax.set_yticklabels(tdf_sorted["parameter"])
+    ax.set_xlabel("Portfolio Economic Capital ($mm)")
+    ax.set_title("Tornado: one-at-a-time sensitivity")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "chart_tornado.png"), dpi=150)
+    plt.close(fig)
+
+    # --- Chart 4: Monte Carlo simulated loss distribution ---
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(mc["losses"], bins=150, color="#4472C4", alpha=0.8)
+    ax.axvline(mc["el"], color="green", linestyle="--", label=f"Expected Loss (${mc['el']:,.0f}mm)")
+    ax.axvline(mc["var_alpha"], color="darkred", linestyle="--",
+               label=f"99.9% VaR (${mc['var_alpha']:,.0f}mm)")
+    ax.set_xlabel("Simulated portfolio loss ($mm)")
+    ax.set_ylabel("Frequency")
+    ax.set_title("Monte Carlo simulated portfolio loss distribution")
+    ax.set_xlim(0, np.quantile(mc["losses"], 0.9995))
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "chart_mc_loss_distribution.png"), dpi=150)
+    plt.close(fig)
+
+    print(f"Charts saved to {OUT_DIR}: chart_ec_vs_rho.png, chart_ec_vs_haircut.png, "
+          f"chart_tornado.png, chart_mc_loss_distribution.png")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+if __name__ == "__main__":
+    print_base_case()
+    print_reality_check()
+    print_ukraine_guarantee_adjustment()
+    g1, g2, base_ec, tdf = print_sensitivity()
+    mc = monte_carlo(PORTFOLIO, lgd=BASE["lgd"], rho=BASE["rho"], h=BASE["h"],
+                      alpha=BASE["alpha"], n_sims=200_000)
+    print_monte_carlo(mc)
+    make_charts(g1, g2, base_ec, tdf, mc)
+    print(f"\nAll CSV/PNG outputs written to: {OUT_DIR}")
